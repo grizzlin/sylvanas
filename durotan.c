@@ -1,4 +1,5 @@
 #include "durotan.h"
+#include "buffer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include "redis.h"
@@ -11,6 +12,8 @@
 
 #define SOCKET "/tmp/sylvanas.durotan.sock"
 #define BUFFER_SIZE 256
+
+#define MSG_ITEM 0
 
 extern uv_loop_t* loop;
 static uv_pipe_t* durotan;
@@ -29,6 +32,9 @@ void durotanInit() {
     int err;
     durotan = malloc(sizeof(uv_pipe_t));
     uv_pipe_init(loop, durotan, 0);
+
+    uv_fs_t req;
+    uv_fs_unlink(loop, &req, SOCKET, NULL);
     
     err = uv_pipe_bind(durotan, SOCKET);
     if(err) ERROR("durotan bind", err);
@@ -51,14 +57,14 @@ void durotanReply(itemQuery* query, char* reply, int n) {
         return;
     }
 
-    // Allocate space for the key, a comma, the stats, a newline, and a null character.
-    int len = strlen(query->key) + 1 + n + 2;
+    // Allocate space for the message, a comma, the key, a comma, the stats, a newline, and a null character.
+    int len = 1 + 1 + strlen(query->key) + 1 + n + 2;
     uv_buf_t* buf = malloc(sizeof(uv_buf_t));
     buf->base = malloc(len * sizeof(char));
     buf->len = len - 1;
 
     // Format the message
-    snprintf(buf->base, len, "%s,%s\n", query->key, reply);
+    snprintf(buf->base, len, "%d,%s,%s\n", MSG_ITEM, query->key, reply);
 
     // Create write request
     uv_write_t* req = (uv_write_t*)malloc(sizeof(uv_write_t));
@@ -110,29 +116,59 @@ void durotanOnRead(uv_stream_t* client, ssize_t size, const uv_buf_t* buf) {
 
     if(size < 0) ERROR("durotan read", size);
 
-    printf("Received query %s\n", (char*) buf->base);
+    printf("%s", (char*) buf->base);
+
+    char* buffer = client->data;
+    char* message;
+    char* m;
 
     // Append chunk onto buffer
-    strcat(client->data, (char*) buf->base);
-    char* p = client->data;
-    char* message = strsep(&p, "\n");
-    if(p == NULL) goto free;
+    bufferAppend(buffer, buf->base, BUFFER_SIZE - strlen(buffer));
 
-    // Create an itemQuery, the entire message is the redis key
-    itemQuery* query = malloc(sizeof(itemQuery));
-    query->key = strdup(message);
-    query->realm = NULL;
-    query->faction = NULL;
-    query->item = -1;
-    query->client = client;
+    // Read a line, bailing out if it isn't a complete line
+    message = m = bufferGetMessage(buffer, BUFFER_SIZE);
+    if(message == NULL) goto free;
 
-    // Look up the key in redis
-    redisQuery(query, durotanOnRedis);
+    // Figure out what kind of message it is
+    int header = bufferGetMessageHeader(&message);
 
-    // Perform buffer nomming
-    int n = strlen(p);
-    memcpy(client->data, p, n);
-    memset(client->data + n, 0, BUFFER_SIZE - n);
+    // Figure out how many pieces there are
+    int elementCount;
+    switch(header) {
+        case MSG_ITEM: elementCount = 3; break;
+    }
+
+    // Parse the pieces
+    char** elements = malloc(elementCount * sizeof(char*));
+    int parsed = bufferSplitMessage(message, elements, elementCount);
+    if(parsed < elementCount) {
+        fprintf(stderr, "durotan received message %d with only %d pieces\n", header, parsed);
+        goto free;
+    }
+
+    // Handle message
+    switch(header) {
+        case MSG_ITEM: {
+            char* realm = elements[0];
+            char* faction = elements[1];
+            int item = atoi(elements[2]);
+            int keyLen = strlen(realm) + 1 +  strlen(faction) + 1 + strlen(elements[2]) + 1;
+
+            itemQuery* query = malloc(sizeof(itemQuery));
+            query->key = malloc(keyLen * sizeof(char));
+            snprintf(query->key, keyLen, "%s,%s,%d", realm, faction, item);
+            query->realm = strdup(realm);
+            query->faction = strdup(faction);
+            query->item = item;
+            query->client = client;
+
+            // Look up the key in redis
+            redisQuery(query, durotanOnRedis);
+            break;
+        }
+    }
+
+    free(m);
 
 free:
     free(buf->base);
@@ -156,14 +192,6 @@ void durotanOnRedis(redisAsyncContext* ctx, void* r, void* q) {
     itemQuery* query = q;
 
     if(reply->type == REDIS_REPLY_NIL) {
-        printf("Effectively going to disk\n");
-
-        // Split up the key now that we need the individual elements.
-        char* s = strdup(query->key);
-        query->realm = strdup(strsep(&s, ","));
-        query->faction = strdup(strsep(&s, ","));
-        query->item = atoi(strsep(&s, ","));
-        free(s);
 
         // Package everything into a mongoAggregateContext
         mongoAggregateContext* context = malloc(sizeof(mongoAggregateContext));
@@ -174,7 +202,6 @@ void durotanOnRedis(redisAsyncContext* ctx, void* r, void* q) {
         uv_queue_work(loop, &context->req, mongoAggregate, durotanOnMongo);
     }
     else if(reply->type == REDIS_REPLY_STRING) {
-        printf("Yay it's in redis\n");
 
         // Reply with the query and the stats from redis
         durotanReply(query, reply->str, reply->len);
