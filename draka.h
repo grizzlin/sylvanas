@@ -3,6 +3,13 @@
 
 #include <uv.h>
 
+struct draka_session {
+    char* prefix;
+    char* buffer;
+};
+
+typedef struct draka_session drakaSession;
+
 void drakaInit();
 void drakaDestroy();
 
