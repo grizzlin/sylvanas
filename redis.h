@@ -20,5 +20,6 @@ void redisInit();
 void redisDestroy();
 void redisQuery(itemQuery* query, redisCallbackFn* cb);
 void redisUpdate(itemQuery* query, char* data);
+void redisClear(char* keys);
 
 #endif

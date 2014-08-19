@@ -34,5 +34,9 @@ void redisQuery(itemQuery* query, redisCallbackFn* cb) {
 }
 
 void redisUpdate(itemQuery* query, char* data) {
-    redisAsyncCommand(ctx, NULL, query, "SET %s %s", query->key, data);
+    redisAsyncCommand(ctx, NULL, NULL, "SET %s %s", query->key, data);
+}
+
+void redisClear(char* keys) {
+    redisAsyncCommand(ctx, NULL, NULL, "DEL %s", keys);
 }
